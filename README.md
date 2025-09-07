@@ -10,8 +10,10 @@
 ```bash
 ansible-playbook -i hosts playbooks/main-ec2-aws.yaml
 ```
-Keep in mind there is no loadbalancer to split load between master nodes.
-the playbook will take the first master node as the main master node to use to join other remaining nodes.
+
+
+**Keep in mind** there is no loadbalancer to split load between master nodes.
+the playbook will take the first master node in the inventory file **hosts** as the main master node to use to join other remaining nodes.
 ```yaml
 [master-group]
 54.210.131.36 
