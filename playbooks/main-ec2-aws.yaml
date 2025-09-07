@@ -1,0 +1,173 @@
+---
+- name: "Setup Nodes"
+  hosts: 
+    - "master-group"
+    - "worker-group"
+
+  become: true
+  tasks:
+  - name: "Update Packages"
+    apt:
+      name: 
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      state: present
+      update_cache: yes
+      cache_valid_time: 30600
+  - name: Disable swap if active
+    shell: | 
+             swapoff -a
+             sed -i '/ swap / s/^/#/' /etc/fstab
+  - name: "Install containerd"
+    apt: "name=containerd"
+  - name: "Directories Creation"
+    file: "path=/etc/containerd state=directory"
+  - name: "Generate Default Configuration File For Containerd"
+    command: "containerd config default | tee /etc/containerd/config.toml"
+  - name: "Start&Enable Containerd"
+    service: "name=containerd state=started enabled=true"
+  - name: "Import Apt Key For kubernetes Repository"
+    get_url:
+      url: https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key
+      dest: /tmp/k8s-release.key
+      mode: '0644'
+  - name: Convert GPG key to binary format
+    command: gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s-release.key
+    args:
+      creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - name: "Add Repository URL"
+    apt_repository: 
+      repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /" 
+      state: "present"
+  - name: "Install Packages"
+    apt:
+      name: 
+      - kubelet
+      - kubectl
+      - kubeadm
+      update_cache: yes
+      state: present
+      cache_valid_time: 30600
+  - name: Setup Ipv4 Forward
+    copy:
+      dest: /etc/sysctl.d/99-kubernetes.conf
+      content: |
+        net.ipv4.ip_forward = 1
+      owner: root
+      group: root
+      mode: '0644'
+  - name: Restart sysctl
+    command: sysctl --system
+
+- name: "Install Main Master Node"
+  hosts:
+  - "{{groups['master-group'][0]}}"
+  become: true
+  tasks:
+
+  - name: Setup Ipv4 Forward
+    copy:
+      dest: /etc/sysctl.d/99-kubernetes.conf
+      content: |
+        net.ipv4.ip_forward = 1
+      owner: root
+      group: root
+      mode: '0644'
+  - name: Restart sysctl
+    command: sysctl --system
+  - name: "Init The Cluster"
+    command: "kubeadm init --pod-network-cidr=192.168.0.0/16 --control-plane-endpoint {{hostvars[groups['master-group'][0]]['ansible_default_ipv4']['address']}}:6443"
+    args:
+      creates: "/etc/kubernetes/admin.conf"
+    when: inventory_hostname == groups['master-group'][0]
+  - name: Ensure .kube Directory Exists
+    when: inventory_hostname == groups['master-group'][0]
+    file:
+      path: /root/.kube
+      state: directory
+      owner: root
+      group: root
+      mode: '0600'
+  - name: Copy File With Owner And Permissions
+    when: inventory_hostname == groups['master-group'][0]
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: /root/.kube/config
+      remote_src: yes
+      owner: root
+      group: root
+      mode: '0600'
+  - name: Generate Token
+    when: inventory_hostname == groups['master-group'][0]
+    command: kubeadm token create 
+    register: kubeadm_token
+  - name: Generate Hash
+    when: inventory_hostname == groups['master-group'][0]
+    shell: |
+      openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt \
+      | openssl rsa -pubin -outform der 2>/dev/null \
+      | openssl dgst -sha256 -hex \
+      | sed 's/^.* //'
+    register: kubeadm_hash
+  - name: Generate Certificate Key
+    shell: |
+      kubeadm init phase upload-certs --upload-certs | awk '/Using certificate key:/ { getline; print }'
+    register: kubeadm_certificate_key  
+    when: inventory_hostname == groups['master-group'][0]
+  - name: Set Dummy Hostt
+    when: inventory_hostname == groups['master-group'][0]
+    add_host:
+      name: "K8S_HASH_TOKEN"
+      token: "{{kubeadm_token.stdout}}"
+      hash: "{{kubeadm_hash.stdout}}"
+      key: "{{kubeadm_certificate_key.stdout}}"
+      ip: "{{hostvars[groups['master-group'][0]]['ansible_default_ipv4']['address']}}" 
+  - name: "Install CNI"
+    command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+    changed_when: false
+
+  - name: "Output Check"
+    when: inventory_hostname != groups['master-group'][0]
+    debug:
+      msg: >-
+        kubeadm join {{hostvars['K8S_HASH_TOKEN']['ip'] }}:6443 --token {{ hostvars['K8S_HASH_TOKEN']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_HASH_TOKEN']['hash'] }} --control-plane --certificate-key {{kubeadm_certificate_key.stdout}}
+
+- name: "Install Secondary Master Nodes"
+  hosts:
+  - "master-group"
+  become: true
+  tasks:
+  - name: Setup Ipv4 Forward
+    when: inventory_hostname != groups['master-group'][0]
+    copy:
+      dest: /etc/sysctl.d/99-kubernetes.conf
+      content: |
+        net.ipv4.ip_forward = 1
+      owner: root
+      group: root
+      mode: '0644'
+  - name: Restart sysctl
+    when: inventory_hostname != groups['master-group'][0]
+    command: sysctl --system
+  - name: "Output Check"
+    when: inventory_hostname != groups['master-group'][0]
+    debug:
+      msg: >-
+        kubeadm join {{hostvars['K8S_HASH_TOKEN']['ip'] }}:6443 --token {{ hostvars['K8S_HASH_TOKEN']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_HASH_TOKEN']['hash'] }} --control-plane --certificate-key {{hostvars['K8S_HASH_TOKEN']['key'] }}
+  - name: "Add Secondary Masters"
+    when: inventory_hostname != groups['master-group'][0]
+    command: kubeadm join {{hostvars['K8S_HASH_TOKEN']['ip'] }}:6443 --token {{ hostvars['K8S_HASH_TOKEN']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_HASH_TOKEN']['hash'] }} --control-plane --certificate-key {{hostvars['K8S_HASH_TOKEN']['key'] }}
+
+- name: "Install Worker Node"
+  become: true
+  hosts: worker-group
+  tasks:
+  - name: "Output Check"
+    debug:
+      msg: >-
+        kubeadm join {{hostvars['K8S_HASH_TOKEN']['ip'] }}:6443 --token {{ hostvars['K8S_HASH_TOKEN']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_HASH_TOKEN']['hash'] }}
+  - name: "Join Worker"
+    command: kubeadm join {{hostvars['K8S_HASH_TOKEN']['ip'] }}:6443 --token {{ hostvars['K8S_HASH_TOKEN']['token'] }} --discovery-token-ca-cert-hash sha256:{{ hostvars['K8S_HASH_TOKEN']['hash'] }}
